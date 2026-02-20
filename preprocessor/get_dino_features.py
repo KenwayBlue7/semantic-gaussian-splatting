@@ -6,8 +6,8 @@ from PIL import Image
 from torchvision import transforms
 
 # 1. Setup
-input_dir = "D:/Gaus/MySplat1/input"
-output_dir = "D:/Gaus/MySplat1/features"
+input_dir = "D:/Gaus/Buddha/input"
+output_dir = "D:/Gaus/Buddha/features"
 os.makedirs(output_dir, exist_ok=True)
 
 # 2. Load DINOv2 Model (ViT-L is best for 8GB VRAM balance)

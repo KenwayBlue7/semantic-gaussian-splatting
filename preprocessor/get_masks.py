@@ -5,8 +5,8 @@ import torch
 from sam2.build_sam import build_sam2_video_predictor
 
 # 1. Setup paths
-video_dir = "D:/Gaus/MySplat1/input"
-output_dir = "D:/Gaus/MySplat1/masks"
+video_dir = "D:/Gaus/Buddha/input"
+output_dir = "D:/Gaus/Buddha/masks"
 os.makedirs(output_dir, exist_ok=True)
 
 # Use the 2.1 versions if you downloaded them, otherwise use 2.0

@@ -5,8 +5,8 @@ from tqdm import tqdm
 
 # 1. Setup paths
 # Update these to match your directory structure
-input_dir = "D:/Gaus/MySplat1/features"
-output_dir = "D:/Gaus/MySplat1/features_pca"
+input_dir = "D:/Gaus/Buddha/features"
+output_dir = "D:/Gaus/Buddha/features_pca"
 os.makedirs(output_dir, exist_ok=True)
 
 # Get list of all feature files
