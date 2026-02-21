@@ -19,8 +19,9 @@ import cv2
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda",
+                 train_test_exp=False, is_test_dataset=False, is_test_view=False,
+                 boundary_mask=None                          # ← new argument
                  ):
         super(Camera, self).__init__()
 
@@ -36,7 +37,7 @@ class Camera(nn.Module):
             self.data_device = torch.device(data_device)
         except Exception as e:
             print(e)
-            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
+            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device")
             self.data_device = torch.device("cuda")
 
         resized_image_rgb = PILtoTorch(image, resolution)
@@ -44,7 +45,7 @@ class Camera(nn.Module):
         self.alpha_mask = None
         if resized_image_rgb.shape[0] == 4:
             self.alpha_mask = resized_image_rgb[3:4, ...].to(self.data_device)
-        else: 
+        else:
             self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(self.data_device))
 
         if train_test_exp and is_test_view:
@@ -56,6 +57,26 @@ class Camera(nn.Module):
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
+
+        # ── Boundary mask ──────────────────────────────────────────────────────
+        # boundary_mask arrives as a (1, H, W) float32 tensor from load_boundary_mask(),
+        # or None if no boundary file was found for this camera.
+        if boundary_mask is not None:
+            # Resize to match the actual render resolution if dimensions differ
+            if (boundary_mask.shape[2] != self.image_width or
+                    boundary_mask.shape[1] != self.image_height):
+                boundary_mask = torch.nn.functional.interpolate(
+                    boundary_mask.unsqueeze(0),             # (1, 1, H, W)
+                    size=(self.image_height, self.image_width),
+                    mode="nearest"
+                ).squeeze(0)                                # back to (1, H, W)
+
+            self.boundary_mask = boundary_mask.to(self.data_device)   # (1, H, W) on CUDA
+        else:
+            # No boundary file — store an explicit None so downstream code can
+            # do a simple  `if cam.boundary_mask is not None`  guard.
+            self.boundary_mask = None
+        # ──────────────────────────────────────────────────────────────────────
 
         self.invdepthmap = None
         self.depth_reliable = False
@@ -69,7 +90,7 @@ class Camera(nn.Module):
                 if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
                     self.depth_reliable = False
                     self.depth_mask *= 0
-                
+
                 if depth_params["scale"] > 0:
                     self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
 
@@ -84,7 +105,7 @@ class Camera(nn.Module):
         self.scale = scale
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0, 1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         

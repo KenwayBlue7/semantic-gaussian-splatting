@@ -12,11 +12,14 @@
 import os
 import random
 import json
+import numpy as np
+import PIL
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+import cv2
 
 class Scene:
 
@@ -98,3 +101,62 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+def loadCam(args, id, cam_info, resolution_scale):
+    orig_w, orig_h = cam_info.width, cam_info.height
+
+    if args.resolution in [1, 2, 4, 8]:
+        resolution = round(orig_w / (resolution_scale * args.resolution)), \
+                     round(orig_h / (resolution_scale * args.resolution))
+    else:
+        if args.resolution == -1:
+            if orig_w > 1600:
+                global WARNED
+                if not WARNED:
+                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width),"
+                          " rescaling to 1.6K.\n "
+                          "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                    WARNED = True
+                global_down = orig_w / 1600
+            else:
+                global_down = 1
+        else:
+            global_down = orig_w / args.resolution
+
+        scale = float(global_down) * float(resolution_scale)
+        resolution = (int(orig_w / scale), int(orig_h / scale))
+
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+
+    gt_image = resized_image_rgb[:3, ...]
+    loaded_mask = None
+
+    if resized_image_rgb.shape[0] == 4:
+        loaded_mask = resized_image_rgb[3:4, ...]
+
+    # Load invdepthmap if available
+    invdepthmap = None
+    if cam_info.depth_path != "":
+        try:
+            invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32)
+        except:
+            print(f"Error reading depth map: {cam_info.depth_path}")
+
+    return Camera(
+        colmap_id=cam_info.uid,
+        R=cam_info.R,
+        T=cam_info.T,
+        FoVx=cam_info.FovX,
+        FoVy=cam_info.FovY,
+        depth_params=cam_info.depth_params,
+        image=cam_info.image,
+        invdepthmap=invdepthmap,
+        image_name=cam_info.image_name,
+        uid=id,
+        data_device=args.data_device,
+        resolution=resolution,
+        train_test_exp=args.train_test_exp,
+        is_test_dataset=args.is_test_dataset if hasattr(args, "is_test_dataset") else False,
+        is_test_view=cam_info.is_test,
+        boundary_mask=cam_info.boundary_mask,       # ← THE MISSING LINK
+    )

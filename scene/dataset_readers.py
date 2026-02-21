@@ -12,7 +12,7 @@
 import os
 import sys
 from PIL import Image
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -22,7 +22,10 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+import torch
+import torch.nn.functional as F
 
+# ── Step 1: Add boundary_mask field to CameraInfo ─────────────────────────────
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -36,6 +39,7 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    boundary_mask: Optional[torch.Tensor] = None  # (1, H, W) float32, or None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -44,6 +48,45 @@ class SceneInfo(NamedTuple):
     nerf_normalization: dict
     ply_path: str
     is_nerf_synthetic: bool
+
+# ── Step 2: Helper function to load a boundary map ────────────────────────────
+def load_boundary_mask(
+    boundary_path: str,
+    target_width: int,
+    target_height: int
+) -> Optional[torch.Tensor]:
+    """
+    Load a boundary map image and return it as a (1, H, W) float32 tensor,
+    resized to (target_height, target_width) using nearest-neighbour interpolation
+    to preserve sharp boundary edges.
+
+    Returns None if the file does not exist or cannot be opened.
+    """
+    if not os.path.exists(boundary_path):
+        return None
+
+    try:
+        # Open as grayscale — boundary maps are single-channel
+        boundary_img = Image.open(boundary_path).convert("L")
+
+        # Resize to match the RGB image resolution (nearest = no blurring of edges)
+        if (boundary_img.width, boundary_img.height) != (target_width, target_height):
+            boundary_img = boundary_img.resize(
+                (target_width, target_height),
+                resample=Image.NEAREST
+            )
+
+        # Convert to (1, H, W) float32 tensor, normalised to [0, 1]
+        boundary_tensor = torch.from_numpy(
+            np.array(boundary_img, dtype=np.float32)
+        ).unsqueeze(0) / 255.0          # shape: (1, H, W)
+
+        return boundary_tensor
+
+    except Exception as e:
+        print(f"\n[WARNING] Could not load boundary map at '{boundary_path}': {e}")
+        return None
+
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
@@ -68,11 +111,16 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params,
+                      images_folder, depths_folder, test_cam_names_list,
+                      boundaries_folder: str = ""):          # ← Step 3: new arg
+    """
+    boundaries_folder: absolute path to the 'boundaries/' directory.
+                       Pass an empty string to skip boundary loading.
+    """
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
-        # the exact output you're looking for:
         sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
         sys.stdout.flush()
 
@@ -85,11 +133,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
+        if intr.model == "SIMPLE_PINHOLE":
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
+        elif intr.model == "PINHOLE":
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
@@ -109,13 +157,37 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+        # ── Step 3: Resolve and load the matching boundary map ────────────────
+        # Convention: boundaries/<image_stem>.png  (same stem, always .png)
+        image_stem = extr.name[:-n_remove]          # filename without extension
+        if boundaries_folder != "":
+            boundary_path = os.path.join(boundaries_folder, f"{image_stem}.png")
+        else:
+            boundary_path = ""
+
+        boundary_mask = load_boundary_mask(boundary_path, width, height)
+
+        if boundaries_folder != "" and boundary_mask is None:
+            print(f"\n[WARNING] No boundary map found for '{image_name}' "
+                  f"(expected: {boundary_path})")
+        # ─────────────────────────────────────────────────────────────────────
+
+        cam_info = CameraInfo(
+            uid=uid, R=R, T=T,
+            FovY=FovY, FovX=FovX,
+            depth_params=depth_params,
+            image_path=image_path,
+            image_name=image_name,
+            depth_path=depth_path,
+            width=width, height=height,
+            is_test=image_name in test_cam_names_list,
+            boundary_mask=boundary_mask,        # ← attached here
+        )
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
     return cam_infos
+
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -190,12 +262,29 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     else:
         test_cam_names_list = []
 
-    reading_dir = "images" if images == None else images
+    reading_dir = "images" if images is None else images
+
+    # ── Derive the boundaries directory from the dataset root ─────────────────
+    # Expected layout:  <dataset_root>/boundaries/<image_stem>.png
+    boundaries_folder = os.path.join(path, "boundaries")
+    if not os.path.isdir(boundaries_folder):
+        print(f"[INFO] No 'boundaries/' directory found at '{boundaries_folder}'. "
+              "Boundary masks will not be loaded.")
+        boundaries_folder = ""
+    else:
+        print(f"[INFO] Loading boundary maps from: {boundaries_folder}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     cam_infos_unsorted = readColmapCameras(
-        cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
-        images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        depths_params=depths_params,
+        images_folder=os.path.join(path, reading_dir),
+        depths_folder=os.path.join(path, depths) if depths != "" else "",
+        test_cam_names_list=test_cam_names_list,
+        boundaries_folder=boundaries_folder,        # ← new kwarg
+    )
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
@@ -225,8 +314,14 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
                            is_nerf_synthetic=False)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, depths_folder, white_background, is_test, extension=".png"):
+# ── Step 4: NeRF Synthetic parity ─────────────────────────────────────────────
+def readCamerasFromTransforms(path, transformsfile, depths_folder,
+                               white_background, is_test, extension=".png"):
     cam_infos = []
+
+    # Boundaries directory sits alongside images/transforms
+    boundaries_folder = os.path.join(path, "boundaries")
+    has_boundaries = os.path.isdir(boundaries_folder)
 
     with open(os.path.join(path, transformsfile)) as json_file:
         contents = json.load(json_file)
@@ -236,14 +331,10 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
         for idx, frame in enumerate(frames):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
-            # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
             c2w[:3, 1:3] *= -1
-
-            # get the world-to-camera transform and set R, T
             w2c = np.linalg.inv(c2w)
-            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
+            R = np.transpose(w2c[:3, :3])
             T = w2c[:3, 3]
 
             image_path = os.path.join(path, cam_name)
@@ -251,27 +342,39 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             image = Image.open(image_path)
 
             im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
+            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
             norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+            arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
 
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
-            FovX = fovx
-
             depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
-                            image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
-            
+            # ── Step 4: Load boundary for this frame ──────────────────────────
+            if has_boundaries:
+                boundary_path = os.path.join(boundaries_folder, f"{image_name}.png")
+            else:
+                boundary_path = ""
+
+            boundary_mask = load_boundary_mask(boundary_path, image.size[0], image.size[1])
+            # ─────────────────────────────────────────────────────────────────
+
+            cam_infos.append(CameraInfo(
+                uid=idx, R=R, T=T,
+                FovY=fovy, FovX=fovx,
+                image_path=image_path,
+                image_name=image_name,
+                width=image.size[0], height=image.size[1],
+                depth_path=depth_path,
+                depth_params=None,
+                is_test=is_test,
+                boundary_mask=boundary_mask,        # ← attached here
+            ))
+
     return cam_infos
 
-def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"):
 
+def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"):
     depths_folder=os.path.join(path, depths) if depths != "" else ""
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", depths_folder, white_background, False, extension)
@@ -311,5 +414,5 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender": readNerfSyntheticInfo
 }
