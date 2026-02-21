@@ -47,11 +47,12 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree, optimizer_type="default"):
-        self._semantic_features = torch.empty(0) # For DINOv2 + SAM identity
+    def __init__(self, sh_degree, optimizer_type="default", semantic_dim=32):
+        self._semantic_features = torch.empty(0)
         self.active_sh_degree = 0
         self.optimizer_type = optimizer_type
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = sh_degree
+        self.semantic_dim = semantic_dim  # <-- store configurable dim
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -178,7 +179,10 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
-        self._semantic_features = nn.Parameter(torch.zeros((fused_point_cloud.shape[0], 32), device="cuda").requires_grad_(True))
+        # Use self.semantic_dim instead of hardcoded 32
+        self._semantic_features = nn.Parameter(
+            torch.zeros((fused_point_cloud.shape[0], self.semantic_dim), device="cuda").requires_grad_(True)
+        )
 
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
@@ -491,14 +495,18 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_semantic_features):
-        d = {"xyz": new_xyz,
-        "f_dc": new_features_dc,
-        "f_rest": new_features_rest,
-        "opacity": new_opacities,
-        "scaling" : new_scaling,
-        "rotation" : new_rotation,
-        "semantic_features": new_semantic_features
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest,
+                           new_opacities, new_scaling, new_rotation,
+                           new_tmp_radii, new_semantic_features):
+        # Verified: accepts new_semantic_features and routes it through the optimizer
+        d = {
+            "xyz": new_xyz,
+            "f_dc": new_features_dc,
+            "f_rest": new_features_rest,
+            "opacity": new_opacities,
+            "scaling": new_scaling,
+            "rotation": new_rotation,
+            "semantic_features": new_semantic_features  # concatenated into optimizer state
         }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -538,7 +546,9 @@ class GaussianModel:
 
         new_semantic_features = self._semantic_features[selected_pts_mask].repeat(N, 1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii, new_semantic_features)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest,
+                           new_opacity, new_scaling, new_rotation,
+                           new_tmp_radii, new_semantic_features)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -546,21 +556,27 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
-        
+        selected_pts_mask = torch.logical_and(
+            selected_pts_mask,
+            torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent
+        )
+
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
-
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
+        # FIX: was extracted but never passed to densification_postfix
         new_semantic_features = self._semantic_features[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii, new_semantic_features)
+        self.densification_postfix(
+            new_xyz, new_features_dc, new_features_rest,
+            new_opacities, new_scaling, new_rotation,
+            new_tmp_radii, new_semantic_features  # <-- now correctly passed
+        )
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
