@@ -13,12 +13,15 @@ import os
 import random
 import json
 import numpy as np
-import PIL
+from PIL import Image                                           # ← add PIL Image
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
+from scene.cameras import Camera                               # ← add Camera
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.general_utils import PILtoTorch                     # ← add PILtoTorch
+import torch                                                   # ← add torch
 import cv2
 
 class Scene:
@@ -106,8 +109,10 @@ def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.width, cam_info.height
 
     if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w / (resolution_scale * args.resolution)), \
-                     round(orig_h / (resolution_scale * args.resolution))
+        resolution = (
+            round(orig_w / (resolution_scale * args.resolution)),
+            round(orig_h / (resolution_scale * args.resolution))
+        )
     else:
         if args.resolution == -1:
             if orig_w > 1600:
@@ -126,21 +131,13 @@ def loadCam(args, id, cam_info, resolution_scale):
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-
-    gt_image = resized_image_rgb[:3, ...]
-    loaded_mask = None
-
-    if resized_image_rgb.shape[0] == 4:
-        loaded_mask = resized_image_rgb[3:4, ...]
-
     # Load invdepthmap if available
     invdepthmap = None
     if cam_info.depth_path != "":
         try:
             invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32)
-        except:
-            print(f"Error reading depth map: {cam_info.depth_path}")
+        except Exception as e:
+            print(f"\n[WARNING] Could not load depth map '{cam_info.depth_path}': {e}")
 
     return Camera(
         colmap_id=cam_info.uid,
@@ -149,14 +146,14 @@ def loadCam(args, id, cam_info, resolution_scale):
         FoVx=cam_info.FovX,
         FoVy=cam_info.FovY,
         depth_params=cam_info.depth_params,
-        image=cam_info.image,
+        image=Image.open(cam_info.image_path),
         invdepthmap=invdepthmap,
         image_name=cam_info.image_name,
         uid=id,
-        data_device=args.data_device,
         resolution=resolution,
+        data_device=args.data_device,
         train_test_exp=args.train_test_exp,
-        is_test_dataset=args.is_test_dataset if hasattr(args, "is_test_dataset") else False,
+        is_test_dataset=getattr(args, "is_test_dataset", False),
         is_test_view=cam_info.is_test,
-        boundary_mask=cam_info.boundary_mask,       # ← THE MISSING LINK
+        boundary_mask=cam_info.boundary_mask,   # ← forwarded for both train AND test
     )

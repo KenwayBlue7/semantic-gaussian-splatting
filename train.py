@@ -11,8 +11,9 @@
 
 import os
 import torch
-import math  # Add this
-import numpy as np # Add this
+import math
+import numpy as np
+import torch.nn.functional as F
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -42,7 +43,8 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations,
+             checkpoint_iterations, checkpoint, debug_from):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -110,29 +112,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg,
+                            use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE)
+        image, viewspace_point_tensor, visibility_filter, radii = (
+            render_pkg["render"],
+            render_pkg["viewspace_points"],
+            render_pkg["visibility_filter"],
+            render_pkg["radii"],
+        )
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
             image *= alpha_mask
 
-        # Loss
-
-
-        # gt_image = viewpoint_cam.original_image.cuda()
-        # Ll1 = l1_loss(image, gt_image)
-        # if FUSED_SSIM_AVAILABLE:
-        #     ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
-        # else:
-        #     ssim_value = ssim(image, gt_image)
-
-        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        # --- [START OF MODIFICATION] ---
-        # 1. Standard RGB Loss
+        # ── 1. Standard RGB Loss ───────────────────────────────────────────────
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        
+
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
@@ -140,31 +137,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
-        # 2. Hybrid Feature Distillation (Semantic Loss)
-        # We start distillation after iteration 1000 so geometry can stabilize first
+        # ── 2. Boundary Guidance Loss (3DGS-DET) ──────────────────────────────
+        # Retrieve the pre-loaded boundary mask for this camera.
+        # boundary_mask is (1, H, W) float32 on CUDA, or None if no file exists.
+        boundary_mask = viewpoint_cam.boundary_mask
+
+        if boundary_mask is not None:
+            # Per-pixel L1 error, kept un-reduced so we can weight spatially
+            per_pixel_l1 = torch.abs(image - gt_image)         # (3, H, W)
+
+            # Broadcast (1, H, W) mask across all 3 colour channels
+            # Zero-out non-boundary pixels; only edge regions contribute
+            boundary_loss = (per_pixel_l1 * boundary_mask).mean()
+
+            # Scale by lambda and accumulate into the total loss
+            loss = loss + opt.lambda_boundary * boundary_loss
+        # ── End Boundary Guidance Loss ─────────────────────────────────────────
+
+        # ── 3. Hybrid Feature Distillation (Semantic Loss) ────────────────────
         if iteration > 1000:
-            feat_path = os.path.join(dataset.source_path, "features_pca", viewpoint_cam.image_name + ".npy")
-            
+            feat_path = os.path.join(dataset.source_path, "features_pca",
+                                     viewpoint_cam.image_name + ".npy")
             if os.path.exists(feat_path):
-                # Load PCA features [H_patch * W_patch, 32]
                 gt_feats = torch.from_numpy(np.load(feat_path)).cuda().float()
-                
-                # Rendered features from our updated renderer [32, H, W]
                 rendered_feats = render_pkg["render_features"]
                 H, W = image.shape[1], image.shape[2]
-                
-                # Resize GT features to match rendered image resolution
-                # DINOv2 patches are usually square; we reshape to [1, 32, patch_h, patch_w]
                 patch_dim = int(math.sqrt(gt_feats.shape[0]))
                 gt_feats = gt_feats.view(1, patch_dim, patch_dim, 32).permute(0, 3, 1, 2)
-                gt_feats_rescaled = F.interpolate(gt_feats, size=(H, W), mode='bilinear', align_corners=False).squeeze(0)
-
-                # MSE Loss for semantic distillation
+                gt_feats_rescaled = F.interpolate(
+                    gt_feats, size=(H, W), mode='bilinear', align_corners=False
+                ).squeeze(0)
                 loss_semantic = F.mse_loss(rendered_feats, gt_feats_rescaled)
-                
-                # lambda_feat 0.01 is a safe starting point for 8GB VRAM
                 loss += 0.01 * loss_semantic
-        # --- [END OF MODIFICATION] ---
+        # ── End Semantic Loss ──────────────────────────────────────────────────
 
         # Depth regularization
         Ll1depth_pure = 0.0

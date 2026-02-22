@@ -66,12 +66,12 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test):
     camera_list = []
-
-    for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))
-
+    for id, cam_info in enumerate(cam_infos):
+        # loadCam handles boundary_mask forwarding internally for every camera,
+        # whether train (is_test=False) or test (is_test=True)
+        camera_list.append(loadCam(args, id, cam_info, resolution_scale))
     return camera_list
 
 def camera_to_JSON(id, camera : Camera):
